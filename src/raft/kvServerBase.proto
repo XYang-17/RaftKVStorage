@@ -1,0 +1,38 @@
+syntax = "proto3";
+
+
+package raft;
+
+option cc_generic_services = true;
+
+message getArgs{
+  bytes key = 1 ;
+  bytes clientId = 2 ;
+  int32 requestId = 3;
+}
+
+
+message getReply  {
+  bytes err = 1;
+  bytes value = 2;
+
+}
+
+
+message putArgs  {
+  bytes key = 1;
+  bytes value = 2;
+  bytes clientId = 4;
+  int32 requestId = 5;
+}
+
+
+message putReply  {
+  bytes err = 1;
+}
+
+
+service kvServerBase{
+  rpc put (putArgs) returns (putReply);
+  rpc get (getArgs) returns (getReply);
+}
