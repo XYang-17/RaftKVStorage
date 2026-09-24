@@ -11,8 +11,7 @@ namespace raft{
 kvServer::kvServer(int me, int maxRaftStateSize, const std::string &file):
     _M_me(me),
     _M_maxRaftStateSize(maxRaftStateSize),
-    _M_applyChan(std::make_shared<safequeue<applyMessage>>()),
-    _M_raftNode(std::make_shared<raft>())
+    _M_applyChan(std::make_shared<safequeue<applyMessage>>())
 {
     // 加载rpc配置
     rpc::mprpcConfig cfg;
@@ -39,7 +38,7 @@ kvServer::kvServer(int me, int maxRaftStateSize, const std::string &file):
 
     std::shared_ptr<persister> pstr = std::make_shared<persister>(_M_me);
     // 初始化底层raft节点
-    _M_raftNode->init(_M_me, pstr, helpers, _M_applyChan);
+    _M_raftNode.reset(new raft(_M_me, pstr, helpers, _M_applyChan, RAFT_READ_THREAD_NUM));
 
     // 加载快照
     std::string shot;
@@ -70,8 +69,9 @@ void kvServer::get(
     getReply *reply,
     protobuf::Closure *done)
 {
-    _L_get(args, reply);
-    done->Run();
+    _M_raftNode->executeGet(&kvServer::_L_get, this, ctrl, args, reply, done);
+    // _L_get(ctrl, args, reply, done);
+    // done->Run(); // 改由_L_get在线程池中执行
 }
 
 void kvServer::put(
@@ -85,77 +85,119 @@ void kvServer::put(
 }
 
 
-void kvServer::_L_get(const getArgs *args, getReply *reply){
-    op command{op::Get, args->key(), "", args->clientid(), args->requestid()};
-    
-    // int index = -1, _;
-    // bool asLeader = false;
-    // _M_raftNode->execute(command, &index, &_, &asLeader);
-    auto [index, term] = _M_raftNode->execute(command);
+// void kvServer::_L_get(const getArgs *args, getReply *reply){
+//     op command{op::Get, args->key(), "", args->clientid(), args->requestid()};
+//
+//     // int index = -1, _;
+//     // bool asLeader = false;
+//     // _M_raftNode->execute(command, &index, &_, &asLeader);
+//     auto [index, term] = _M_raftNode->execute(command);
+//
+//     if(-1 == index || -1 == term){
+//         reply->set_err(RAFT_ERR_WRONG_LEADER);
+//         return;
+//     }
+//
+//     // 获取/创建命令执行完毕管道
+//     std::unique_lock<std::mutex> lock(_M_mutex);
+//     if(_M_appliedChan.end() == _M_appliedChan.find(index)){
+//         _M_appliedChan.insert({index, new safequeue<op>});
+//     }
+//     auto que = _M_appliedChan[index];
+//     lock.unlock();  // 解锁，让其它线程/协程执行完成命令后，将命令推入命令执行完毕管道
+//
+//     // 等待获取已完成命令
+//     op raftCommitOp;
+//     if(!que->pop(raftCommitOp, std::chrono::milliseconds(RAFT_CONSENSUS_TIME))){
+//         // 超时失败
+//         // int _;
+//         // bool asLeader = false;
+//         // _M_raftNode->getState(&_, &asLeader);
+//         auto [_, asLeader] = _M_raftNode->getState();
+//      
+//         // leader节点，且已经被执行过
+//         // 未被执行过的新命令执行超时失败，此时不知道此节点中的数据是否是集群中已达成共识的数据，为保证一致性，不能返回数据
+//         if(asLeader && _L_duplicateRequest(command.clientId, command.requestId)){
+//             auto res = _L_executeGetOp(command);
+//             if(!res.first){
+//                 reply->set_err(RAFT_ERR_NO_KEY);
+//             }
+//             else{
+//                 reply->set_err(RAFT_OK);
+//                 reply->set_value(res.second);
+//             }
+//         }
+//         else{
+//             reply->set_err(RAFT_TIMEOUT);
+//         }
+//     }
+//     // 可能因leader变更导致日志覆盖，需要确定被执行的是我提交的这一条
+//     // 日志/命令匹配(term+index)，回去数据并返回
+//     else if(raftCommitOp.clientId == command.clientId
+//         && raftCommitOp.requestId == command.requestId)
+//     {
+//         auto res = _L_executeGetOp(command);
+//         if(!res.first){
+//             reply->set_err(RAFT_ERR_NO_KEY);
+//             reply->set_err("");
+//         }
+//         else{
+//             reply->set_err(RAFT_OK);
+//             reply->set_value(res.second);
+//         }
+//     }
+//     // 匹配失败，回复失败
+//     else{
+//         reply->set_err(RAFT_ERR_WRONG_LEADER);
+//     }
+//
+//     // 移除命令执行完毕管道
+//     lock.lock();
+//     que = _M_appliedChan[index];
+//     _M_appliedChan.erase(index);
+//     delete que;
+// }
 
-    if(-1 == index || -1 == term){
-        reply->set_err(RAFT_KVSTORAGE_ERR_WRONG_LEADER);
+// void kvServer::_L_get(const getArgs *args, getReply *reply){
+//     if(!_M_raftNode->waitApplied()){
+//         reply->set_err(RAFT_TIMEOUT);
+//         return;
+//     }
+// 
+//     op command{op::Get, args->key(), "", args->clientid(), args->requestid()};
+//     auto res = _L_executeGetOp(command);
+//     if(!res.first){
+//         reply->set_err(RAFT_ERR_NO_KEY);
+//         return;
+//     }
+//     
+//     reply->set_value(res.second);
+//     reply->set_err(RAFT_OK);
+// }
+
+void kvServer::_L_get(
+    protobuf::RpcController *ctrl,
+    const getArgs *args,
+    getReply *reply,
+    protobuf::Closure *done
+)
+{
+    if(!_M_raftNode->waitApplied()){
+        reply->set_err(RAFT_TIMEOUT);
         return;
     }
 
-    // 获取/创建命令执行完毕管道
-    std::unique_lock<std::mutex> lock(_M_mutex);
-    if(_M_appliedChan.end() == _M_appliedChan.find(index)){
-        _M_appliedChan.insert({index, new safequeue<op>});
+    op command{op::Get, args->key(), "", args->clientid(), args->requestid()};
+    auto res = _L_executeGetOp(command);
+    if(!res.first){
+        reply->set_err(RAFT_ERR_NO_KEY);
+        return;
     }
-    auto que = _M_appliedChan[index];
-    lock.unlock();  // 解锁，让其它线程/协程执行完成命令后，将命令推入命令执行完毕管道
+    
+    reply->set_value(res.second);
+    reply->set_err(RAFT_OK);
 
-    // 等待获取已完成命令
-    op raftCommitOp;
-    if(!que->pop(raftCommitOp, std::chrono::milliseconds(RAFT_KVSTORAGE_CONSENSUS_TIME))){
-        // 超时失败
-        // int _;
-        // bool asLeader = false;
-        // _M_raftNode->getState(&_, &asLeader);
-        auto [_, asLeader] = _M_raftNode->getState();
-        
-        // leader节点，且已经被执行过
-        // 未被执行过的新命令执行超时失败，此时不知道此节点中的数据是否是集群中已达成共识的数据，为保证一致性，不能返回数据
-        if(asLeader && _L_duplicateRequest(command.clientId, command.requestId)){
-            auto res = _L_executeGetOp(command);
-            if(!res.first){
-                reply->set_err(RAFT_KVSTORAGE_ERR_NO_KEY);
-            }
-            else{
-                reply->set_err(RAFT_KVSTORAGE_OK);
-                reply->set_value(res.second);
-            }
-        }
-        else{
-            reply->set_err(RAFT_KVSTORAGE_TIMEOUT);
-        }
-    }
-    // 可能因leader变更导致日志覆盖，需要确定被执行的是我提交的这一条
-    // 日志/命令匹配(term+index)，回去数据并返回
-    else if(raftCommitOp.clientId == command.clientId
-        && raftCommitOp.requestId == command.requestId)
-    {
-        auto res = _L_executeGetOp(command);
-        if(!res.first){
-            reply->set_err(RAFT_KVSTORAGE_ERR_NO_KEY);
-            reply->set_err("");
-        }
-        else{
-            reply->set_err(RAFT_KVSTORAGE_OK);
-            reply->set_value(res.second);
-        }
-    }
-    // 匹配失败，回复失败
-    else{
-        reply->set_err(RAFT_KVSTORAGE_ERR_WRONG_LEADER);
-    }
-
-    // 移除命令执行完毕管道
-    lock.lock();
-    que = _M_appliedChan[index];
-    _M_appliedChan.erase(index);
-    delete que;
+    done->Run();
 }
 
 void kvServer::_L_put(const putArgs *args, putReply *reply){
@@ -174,7 +216,7 @@ void kvServer::_L_put(const putArgs *args, putReply *reply){
     // 底层raft节点不是leader，禁止写入
     if(-1 == index || -1 == term){
         // LOG_INFO << "not leader";
-        reply->set_err(RAFT_KVSTORAGE_ERR_WRONG_LEADER);
+        reply->set_err(RAFT_ERR_WRONG_LEADER);
         return;
     }
     
@@ -190,15 +232,15 @@ void kvServer::_L_put(const putArgs *args, putReply *reply){
     // 等待获取已完成命令
     op raftCommitOp;
     // 超时失败
-    if(!que->pop(raftCommitOp, std::chrono::milliseconds(RAFT_KVSTORAGE_CONSENSUS_TIME))){
+    if(!que->pop(raftCommitOp, std::chrono::milliseconds(RAFT_CONSENSUS_TIME))){
         LOG_INFO << "pop failure";
         // 已经执行过的请求，回复成功
         if(_L_duplicateRequest(command.clientId, command.requestId)){
-            reply->set_err(RAFT_KVSTORAGE_OK);
+            reply->set_err(RAFT_OK);
         }
         // 失败回复
         else{
-            reply->set_err(RAFT_KVSTORAGE_ERR_WRONG_LEADER);
+            reply->set_err(RAFT_ERR_WRONG_LEADER);
         }
     }
     // 可能因leader变更导致日志覆盖，需要确定被执行的是我提交的这一条
@@ -207,12 +249,12 @@ void kvServer::_L_put(const putArgs *args, putReply *reply){
         && raftCommitOp.requestId == command.requestId)
     {
         LOG_INFO << "ok";
-        reply->set_err(RAFT_KVSTORAGE_OK);
+        reply->set_err(RAFT_OK);
     }
     // 匹配失败，回复失败
     else{
         LOG_INFO << "term change";
-        reply->set_err(RAFT_KVSTORAGE_ERR_WRONG_LEADER);
+        reply->set_err(RAFT_ERR_WRONG_LEADER);
     }
 
     // 移除命令执行完毕管道

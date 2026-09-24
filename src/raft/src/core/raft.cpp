@@ -8,28 +8,30 @@
 
 namespace raft{
 
-void raft::init(
+    
+raft::raft(
     int me,
     std::shared_ptr<persister> pstr,
     std::vector<std::shared_ptr<raftHelper>> helpers,
-    std::shared_ptr<safequeue<applyMessage>> applyCh)
+    std::shared_ptr<safequeue<applyMessage>> applyCh,
+    size_t readThreadNum
+):
+    _M_helpers(helpers),
+    _M_lastResetElectionTime(now()),
+    _M_lastResetHeartBeatTime(_M_lastResetElectionTime),
+    _M_persister(pstr),
+    _M_applyChan(applyCh),
+    _M_commitIndex(0),
+    _M_appliedIndex(0),
+    _M_lastSnapshotIndex(0),
+    _M_lastSnapshotTerm(0),
+    _M_me(me),
+    _M_term(0),
+    _M_vote4(-1),
+    _M_identity(FOLLOWER)
 {
-    _M_me = me;
-    _M_persister = pstr;
-    _M_helpers = helpers;
-
-    std::unique_lock<std::mutex> lock(_M_mutex);
-    _M_identity = FOLLOWER;
-    _M_term = 0;
-    _M_vote4 = -1;
-    _M_applyChan = applyCh;
-    _M_commitIndex = 0;
-    _M_appliedIndex = 0;
-    _M_logs.clear();
     _M_nextIndex.assign(_M_helpers.size(), 0);
     _M_matchIndex.assign(_M_helpers.size(), 0);
-
-    _M_lastResetElectionTime = _M_lastResetHeartBeatTime = now();
 
     std::string state;
     _M_persister->loadState(state); // 从文件中读取序列化状态字符串
@@ -37,53 +39,67 @@ void raft::init(
     if(_M_lastSnapshotIndex > 0){
         _M_appliedIndex = _M_lastSnapshotIndex;
     }
-    lock.unlock();
+
+    _M_readThreads.reset(new threadPool(readThreadNum));
+    _M_readThreads->run(); // 启动读线程池
 
     // 初始化IO管理工具，多协程执行心跳和选举
-    // _M_ioman.reset(new cort::ioman(RAFT_KVSTORAGE_COROUTINE_THREAD_NUM, RAFT_KVSTORAGE_COROUTINE_AS_WORKER));
+    // _M_ioman.reset(new cort::ioman(RAFT_COROUTINE_THREAD_NUM, RAFT_COROUTINE_AS_WORKER));
     // _M_ioman->addTask([this](){this->_L_electionTimeoutTicker();});
     // _M_ioman->addTask([this](){this->_L_leaderHeartBeatTicker();});
     // std::thread ticker([this](){this->_L_electionTimeoutTicker();});
     // ticker.detach();
 
-    std::thread timeoutTicker(&raft::_L_electionTimeoutTicker, this);
-    std::thread heartBeatTicker(&raft::_L_leaderHeartBeatTicker, this);
-    std::thread t(&raft::_L_applierTicker, this);
+    std::thread daemonTicker(&raft::_L_daemonTicker, this);
+    daemonTicker.detach();
 
-    timeoutTicker.detach();
-    heartBeatTicker.detach();
+    std::thread t(&raft::_L_applierTicker, this);
     t.detach();
 }
 
 
 std::pair<int, int> raft::execute(op opt){
     guard_type guard(_M_mutex);
-    // 非leader禁止写入
-    if(LEADER != _M_identity){
-        return {-1, -1};
+    // leader
+    if(LEADER == _M_identity){
+        int new_index = _M_getNewCommandIndex();
+        _M_logs.emplace_back();
+        auto &entry = _M_logs.back();
+        entry.set_command(opt.dump());
+        entry.set_term(_M_term);
+        entry.set_index(new_index);
+        _M_persist(); // 立刻持久化状态
+        LOG_INFO << "logs_size = " << _M_logs.size();
+        
+        return {entry.index(), entry.term()};
     }
-    
-    int new_index = _M_getNewCommandIndex();
-    _M_logs.emplace_back();
-    auto &entry = _M_logs.back();
-    entry.set_command(opt.dump());
-    entry.set_term(_M_term);
-    entry.set_index(new_index);
-    _M_persist(); // 立刻持久化状态
-    LOG_INFO << "logs_size = " << _M_logs.size();
-    
-    return {entry.index(), entry.term()};
+
+    return {-1, -1};
+}
+
+bool raft::waitApplied(){
+    std::unique_lock<std::mutex> lock(_M_mutex);
+    int wait4 = _M_commitIndex;
+    _M_readCondtion.wait_for(
+        lock, std::chrono::microseconds(RAFT_MAX_WAIT_TIME_FOR_READ),
+        [this, &wait4]{ return this->_M_appliedIndex >= wait4; }
+    );
+    return _M_appliedIndex >= wait4;
 }
 
 
 std::vector<applyMessage> raft::_M_getApplyMessages(){
+    LOG_ERROR << "commit_index = " << _M_commitIndex
+        << ", lastLogIndex = " << _M_getLastLogIndex()
+        << ", logsize = " << _M_logs.size()
+        << ", snapshotIndex = " << _M_lastSnapshotIndex;
     // 已提交日志的索引 不能超过 logs中的最新日志的索引
     if(_M_commitIndex > _M_getLastLogIndex()){
-        throw std::runtime_error(std::to_string(__LINE__));
+        throw std::runtime_error(__FILE__+std::to_string(__LINE__));
     }
 
     if(_M_appliedIndex > _M_commitIndex){
-        throw std::runtime_error(std::to_string(__LINE__));
+        throw std::runtime_error(__FILE__+std::to_string(__LINE__));
     }
 
     // 将已提交未应用的日志的命令写入外部数组
@@ -113,82 +129,130 @@ void raft::_L_applierTicker(){
                 _M_applyChan->push(msg);
             }
         }
-        sleep_ms(RAFT_KVSTORAGE_APPLY_INTERVAL);
+        sleep_ms(RAFT_APPLY_INTERVAL);
     }
 }
 
-void raft::_L_leaderHeartBeatTicker(){
+void raft::_L_daemonTicker(){
     while(true){
-        while(LEADER != _M_identity){
-            usleep(RAFT_KVSTORAGE_HEARTBEAT_SLEEP_TIME * 1000);
-        }
-
-        std::chrono::duration<signed long int, std::ratio<1, 1'000'000'000>> sleepTime;
-        std::chrono::system_clock::time_point timeNow;
-        {
-            guard_type guard(_M_mutex);
-            timeNow = now();
-            sleepTime = _M_lastResetHeartBeatTime + std::chrono::milliseconds(RAFT_KVSTORAGE_HEARTBEAT_SLEEP_TIME) - timeNow;
-        }
-
-        // 等待到发送心跳
-        if(std::chrono::duration<double, std::milli>(sleepTime).count() > 1){
-            auto start = std::chrono::steady_clock::now();
-            usleep(std::chrono::duration_cast<std::chrono::microseconds>(sleepTime).count());
-        }
-        
-        // 等待期间定时器被重置，通过其它手段发送了心跳，则重新等到下一次需要发送心跳的时间，避免频繁发送
-        if(std::chrono::duration<double , std::milli>(_M_lastResetHeartBeatTime - timeNow).count() > 0){
-            continue;
-        }
-
-        _L_heartBeat();
-    }
-}
-
-void raft::_L_electionTimeoutTicker(){
-    while(true){
+        // leaderHeartBeat
         while(LEADER == _M_identity){
-            usleep(RAFT_KVSTORAGE_HEARTBEAT_SLEEP_TIME);
+            // while(LEADER != _M_identity){
+            //     usleep(RAFT_HEARTBEAT_SLEEP_TIME * 1000);
+            // }
+
+            std::chrono::duration<signed long int, std::ratio<1, 1'000'000'000>> sleepTime;
+            std::chrono::system_clock::time_point timeNow;
+            {
+                guard_type guard(_M_mutex);
+                timeNow = now();
+                sleepTime = _M_lastResetHeartBeatTime + std::chrono::milliseconds(RAFT_HEARTBEAT_SLEEP_TIME) - timeNow;
+            }
+
+            // 等待到发送心跳
+            if(std::chrono::duration<double, std::milli>(sleepTime).count() > 1){
+                auto start = std::chrono::steady_clock::now();
+                usleep(std::chrono::duration_cast<std::chrono::microseconds>(sleepTime).count());
+            }
+            
+            // 等待期间定时器被重置，通过其它手段发送了心跳，则重新等到下一次需要发送心跳的时间，避免频繁发送
+            if(std::chrono::duration<double , std::milli>(_M_lastResetHeartBeatTime - timeNow).count() > 0){
+                continue;
+            }
+
+            _L_heartBeat();
         }
 
-        std::chrono::duration<signed long int, std::ratio<1, 1'000'000'000>> sleepTime;
-        std::chrono::system_clock::time_point timeNow;
-        {
-            guard_type guard(_M_mutex);
-            timeNow = now();
-            sleepTime = _M_lastResetElectionTime + _M_randomWaitTimeBeforeElection() - timeNow;
-            /*
-            |
-            |
-            |   👈  _M_lastResetElectionTime        ----    ----
-            |                                                ↑
-            |                                                |
-            |   👈 now                              ----    random wait time
-            |                                        ↑       |
-            |                                     sleepTime  |
-            |                                        ↓       ↓
-            |   👈 stand for lection                ----    ----
-            |
-            ↓
-            time
-            */
-        }
+        // electionTimeout
+        while(LEADER != _M_identity){
+            // while(LEADER == _M_identity){
+            //     usleep(RAFT_HEARTBEAT_SLEEP_TIME);
+            // }
 
-        // 等待到发起选举
-        if(std::chrono::duration<double, std::milli>(sleepTime).count() > 1){
-            auto start = std::chrono::steady_clock::now();
-            usleep(std::chrono::duration_cast<std::chrono::microseconds>(sleepTime).count());
+            std::chrono::duration<signed long int, std::ratio<1, 1'000'000'000>> sleepTime;
+            std::chrono::system_clock::time_point timeNow;
+            {
+                guard_type guard(_M_mutex);
+                timeNow = now();
+                sleepTime = _M_lastResetElectionTime + _M_randomWaitTimeBeforeElection() - timeNow;
+                /*
+                |
+                |
+                |   👈  _M_lastResetElectionTime        ----    ----
+                |                                                ↑
+                |                                                |
+                |   👈 now                              ----    random wait time
+                |                                        ↑       |
+                |                                     sleepTime  |
+                |                                        ↓       ↓
+                |   👈 stand for lection                ----    ----
+                |
+                ↓
+                time
+                */
+            }
+
+            // 等待到发起选举
+            if(std::chrono::duration<double, std::milli>(sleepTime).count() > 1){
+                auto start = std::chrono::steady_clock::now();
+                usleep(std::chrono::duration_cast<std::chrono::microseconds>(sleepTime).count());
+            }
+            
+            // 等待期间定时器被重置，收到leader的心跳，则不能发起选举，避免无意义的选举
+            if(std::chrono::duration<double , std::milli>(_M_lastResetElectionTime - timeNow).count() > 0){
+                continue;
+            }
+            
+            _L_stand4Election(); // 干票大的！！！
         }
-        
-        // 等待期间定时器被重置，收到leader的心跳，则不能发起选举，避免无意义的选举
-        if(std::chrono::duration<double , std::milli>(_M_lastResetElectionTime - timeNow).count() > 0){
-            continue;
-        }
-        
-        _L_stand4Election(); // 干票大的！！！
     }
 }
+
+// void raft::_L_electionTimeoutTicker(){
+//     while(LEADER != _M_identity){
+//         // while(LEADER == _M_identity){
+//         //     usleep(RAFT_HEARTBEAT_SLEEP_TIME);
+//         // }
+
+//         std::chrono::duration<signed long int, std::ratio<1, 1'000'000'000>> sleepTime;
+//         std::chrono::system_clock::time_point timeNow;
+//         {
+//             guard_type guard(_M_mutex);
+//             timeNow = now();
+//             sleepTime = _M_lastResetElectionTime + _M_randomWaitTimeBeforeElection() - timeNow;
+//             /*
+//             |
+//             |
+//             |   👈  _M_lastResetElectionTime        ----    ----
+//             |                                                ↑
+//             |                                                |
+//             |   👈 now                              ----    random wait time
+//             |                                        ↑       |
+//             |                                     sleepTime  |
+//             |                                        ↓       ↓
+//             |   👈 stand for lection                ----    ----
+//             |
+//             ↓
+//             time
+//             */
+//         }
+
+//         // 等待到发起选举
+//         if(std::chrono::duration<double, std::milli>(sleepTime).count() > 1){
+//             auto start = std::chrono::steady_clock::now();
+//             usleep(std::chrono::duration_cast<std::chrono::microseconds>(sleepTime).count());
+//         }
+        
+//         // 等待期间定时器被重置，收到leader的心跳，则不能发起选举，避免无意义的选举
+//         if(std::chrono::duration<double , std::milli>(_M_lastResetElectionTime - timeNow).count() > 0){
+//             continue;
+//         }
+        
+//         _L_stand4Election(); // 干票大的！！！
+//     }
+//     std::thread heartBeatTicker(&raft::_L_leaderHeartBeatTicker, this);
+//     heartBeatTicker.detach();
+// }
 
 
 void raft::_L_heartBeat(){

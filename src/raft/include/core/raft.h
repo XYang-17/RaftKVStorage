@@ -34,11 +34,12 @@ public:
     static const int invalidUpdateNextIndex;
     static const std::map<identity, const char *> identityStr;
 
-    void init(
+    raft(
         int me,
         std::shared_ptr<persister> pstr,
         std::vector<std::shared_ptr<raftHelper>> helpers,
-        std::shared_ptr<safequeue<applyMessage>> applyCh
+        std::shared_ptr<safequeue<applyMessage>> applyCh,
+        size_t readThreadNum
     );
 
     // 传出当前任期及此节点是否为leader
@@ -100,6 +101,12 @@ public:
     }
 
     std::pair<int, int> execute(op opt);            // leader对外接口，将命令写入集群(锁)
+    template<typename F, typename ...Args>
+    void executeGet(F&& f, Args&& ...args){
+        _M_readThreads->push(std::move(f), std::forward<Args>(args)...);
+    }                                               // 对外接口，放入线程池执行读请求
+
+    bool waitApplied();                             // 对外接口，等待日志应用到指定index后，或超时返回(锁)
 
     // 远程调用接口，向该节点推送日志
     void appendEntries(
@@ -156,8 +163,8 @@ private:
         static std::random_device dev;
         static std::mt19937 rng(dev());
         static std::uniform_int_distribution<int> dist(
-            RAFT_KVSTORAGE_MIN_WAIT_TIME_BEFORE_ELECTION,
-            RAFT_KVSTORAGE_MAX_WAIT_TIME_BEFORE_ELECTION
+            RAFT_MIN_WAIT_TIME_BEFORE_ELECTION,
+            RAFT_MAX_WAIT_TIME_BEFORE_ELECTION
         );
         return std::chrono::milliseconds(dist(rng));
     }
@@ -266,8 +273,7 @@ private:
     std::vector<applyMessage> _M_getApplyMessages();                    // 传出已提交未应用日志中的命令
 
     void _L_applierTicker();                // 持续将已提交未应用的日志中的命令加入上层命令管道(锁)
-    void _L_leaderHeartBeatTicker();        // leader持续向其它节点发送心跳(锁)
-    void _L_electionTimeoutTicker();        // 非leader持续等待leader的心跳，一旦没等到就发起选举(锁)
+    void _L_daemonTicker();                 // 守护线程，leader持续向其它节点发送心跳，非leader持续等待leader的心跳(锁)
 
     void _L_heartBeat();                    // leader向其它节点发送一次心跳(锁)
     void _L_stand4Election();               // 非leader发起选举(锁)
@@ -318,13 +324,12 @@ protected:
     std::chrono::_V2::system_clock::time_point  _M_lastResetElectionTime;   // 最新一次重置选举的时间，当收到leader时设置该值
     std::chrono::_V2::system_clock::time_point  _M_lastResetHeartBeatTime;  // 最新一次重置心跳的时间，当发送心跳时设置该值
 
-    std::unique_ptr<cort::ioman>                _M_ioman = nullptr; // 协程IO调度工具
-    std::shared_ptr<persister>                  _M_persister;       // 持久化工具
-    std::shared_ptr<safequeue<applyMessage>>    _M_applyChan;       // 上层命令管道
+    std::unique_ptr<cort::ioman>                _M_ioman = nullptr;         // 协程IO调度工具
+    std::shared_ptr<persister>                  _M_persister = nullptr;     // 持久化工具
+    std::shared_ptr<safequeue<applyMessage>>    _M_applyChan = nullptr;     // 上层命令管道
 
-    int      _M_appliedIndex;   // 最新被应用日志索引
     int      _M_commitIndex;    // 最新已提交日志索引
-
+    int      _M_appliedIndex;   // 最新被应用日志索引
     int  _M_lastSnapshotIndex;  // 上层引用拍摄快照时最新一条日志的索引
     int  _M_lastSnapshotTerm;   // _M_lastSnapshotIndex对应所在的任期
 
@@ -334,6 +339,8 @@ protected:
     int         _M_vote4;       // 投票信息(必须持久化变量)
     identity    _M_identity;    // 当前身份
 
+    std::shared_ptr<threadPool> _M_readThreads = nullptr;       // 读请求线程池
+    std::condition_variable     _M_readCondtion;                    // 读请求条件变量
 };
 
     

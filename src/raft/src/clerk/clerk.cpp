@@ -45,15 +45,15 @@ std::string clerk::get(const std::string key){
     while(true){
         getReply reply;
         if(!_M_servers[leaderId]->get(&args, &reply)
-            || RAFT_KVSTORAGE_ERR_WRONG_LEADER == reply.err())
+            || RAFT_ERR_WRONG_LEADER == reply.err())
         {
             // 失败，或者对方不是leader，尝试下一个节点
             leaderId = (leaderId + 1) % _M_servers.size();
             continue;
         }
-        if(RAFT_KVSTORAGE_ERR_NO_KEY == reply.err())
+        if(RAFT_ERR_NO_KEY == reply.err())
         { break; } // key不存在
-        if(RAFT_KVSTORAGE_OK == reply.err()){
+        if(RAFT_OK == reply.err()){
             // 成功
             _M_leaderId = leaderId;
             return reply.value();
@@ -79,12 +79,12 @@ void clerk::put(const std::string key, const std::string value){
             leaderId = (leaderId + 1) % _M_servers.size();
             continue;
         }
-        if(RAFT_KVSTORAGE_OK == reply.err()){
+        if(RAFT_OK == reply.err()){
             // 成功
             _M_leaderId = leaderId;
             return;
         }
-        if(RAFT_KVSTORAGE_ERR_WRONG_LEADER == reply.err()){
+        if(RAFT_ERR_WRONG_LEADER == reply.err()){
             // 对方不是leader，尝试下一个节点
             DPrint(stdout, "Failed to put to leaderId = %u because of non-leader", leaderId);
             leaderId = (leaderId + 1) % _M_servers.size();

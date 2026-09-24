@@ -253,6 +253,71 @@ private:
     }
 };
 
+class threadPool{
+public:
+    threadPool(size_t threads_num): _M_stop(false), _M_threads_num(threads_num) {}
+    ~threadPool(){
+        {
+            std::unique_lock<std::mutex> lock(_M_tasks_mutex);
+            // 标记线程池终止运行
+            _M_stop = true;
+        }
+        // 唤醒所有线程，执行任务队列中的剩余任务
+        _M_condition.notify_all();
+        // 合并线程，确保线程执行结束后释放对象资源
+        for(auto& thread: _M_threads){
+            thread.join();
+        }
+    }
+
+    void run(){
+        // 创建指定数量的线程
+        for(size_t i = 0; i < _M_threads_num; i++){
+            // 创建线程，线程函数指定为lambda函数，循环从任务队列中取出一个任务执行
+            // 并将线程加入线程池数组
+            _M_threads.emplace_back([this]{
+                while(true){
+                    std::unique_lock<std::mutex> lock(_M_tasks_mutex);
+                    _M_condition.wait(lock, [this]{
+                        return _M_stop || !_M_tasks.empty();
+                    }); // 唤醒后检查是否停止或存在新任务
+
+                    // 若线程池终止运行,且当前任务队列为空，结束线程函数，随后线程结束
+                    if(_M_stop && _M_tasks.empty()) return;
+                    // 从任务队列中取出一个任务
+                    std::function<void()> task = std::move(_M_tasks.front());
+                    _M_tasks.pop();
+                    // 解锁，其他线程可以访问任务队列
+                    lock.unlock();
+                    // 执行任务
+                    task();
+                }
+            });
+        }
+    }
+
+    template<class F, class ...Args>
+    void push(F&& f, Args&& ...args){
+        {
+            std::unique_lock<std::mutex> lock(_M_tasks_mutex);
+            // 添加任务到任务队列
+            _M_tasks.emplace(std::bind(std::forward<F>(f), std::forward<Args>(args)...));
+        }
+        // 唤醒一个线程，执行任务
+        _M_condition.notify_one();
+    }
+private:
+    std::vector<std::thread> _M_threads;
+    std::queue<std::function<void()>> _M_tasks;
+    
+    std::mutex _M_tasks_mutex;
+    std::condition_variable _M_condition;
+
+    size_t _M_threads_num;
+
+    bool _M_stop;
+};
+
 
 /*
 判断端口是否可用

@@ -62,8 +62,13 @@ private:
         ia >> *this;
     }
 
-    void _L_get(const getArgs *args, getReply *reply);             // get接口实际获取数据的实现(锁)
-    void _L_put(const putArgs *args, putReply *reply);             // put接口实际存入数据的实现(锁)
+    void _L_get(
+        protobuf::RpcController *ctrl,
+        const getArgs *args,
+        getReply *reply,
+        protobuf::Closure *done
+    );                               // get接口实际获取数据的实现(锁)
+    void _L_put(const putArgs *args, putReply *reply);          // put接口实际存入数据的实现(锁)
 
     void _L_popMessageLoop();                       // 持续从命令管道中取出命令，并执行(锁)
 
@@ -96,8 +101,8 @@ protected:
     std::unordered_map<std::string, int>                    _M_lastRequestId;   // 每个用户已执行的最新请求的Id
     std::unordered_map<int, safequeue<op> *>                _M_appliedChan;     // 命令执行完毕管道
 
-    std::shared_ptr<raft>                       _M_raftNode;    // 底层raft节点
-    std::shared_ptr<safequeue<applyMessage>>    _M_applyChan;   // 命令管道
+    std::shared_ptr<raft>                       _M_raftNode = nullptr;    // 底层raft节点
+    std::shared_ptr<safequeue<applyMessage>>    _M_applyChan = nullptr;   // 命令管道
 
     int          _M_me;                     // raft节点id
     int _M_maxRaftStateSize;                // raft节点状态文件大小最大值
